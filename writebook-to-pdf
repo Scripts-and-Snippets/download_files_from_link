@@ -1,0 +1,246 @@
+#!/usr/bin/env ruby
+#
+# Convert a Writebook book to PDF
+#
+# Depends upon breezy-pdf-lite running via docker
+# docker run -d -p 5001:5001 --name breezy-pdf-lite -e "DEBUG=breezy-pdf-lite:*" -e "PORT=5001" -e "PRIVATE_TOKEN=YOURSUPERSECRETTOKEN" danielwestendorf/breezy-pdf-lite:latest
+#
+# Example
+# $ ruby path_to_this_file export http://yourdomain.com/the_book --debug --output /Users/yourusername/Desktop/mybook.pdf
+#
+# Install:
+# curl -s > 
+require "bundler/inline"
+require "net/http"
+require "erb"
+require "forwardable"
+require "fileutils"
+
+gemfile do
+  source "https://rubygems.org"
+
+  gem "thor"
+  gem "nokogiri"
+  gem "breezy_pdf_lite"
+end
+
+BreezyPDFLite.setup do |config|
+  config.secret_api_key = ENV.fetch("BREEZYPDF_LITE_SECRET_API_KEY", "YOURSUPERSECRETTOKEN")
+  config.base_url = ENV.fetch("BREEZYPDF_BASE_URL", "http://localhost:5001")
+end
+
+class Book
+  attr_reader :url
+
+  def initialize(url)
+    @url = url
+  end
+
+  def uri
+    @uri ||= URI(url)
+  end
+
+  def html
+    @html ||= Net::HTTP.get(uri)
+  end
+
+  def doc
+    @doc ||= Nokogiri(html)
+  end
+
+  def style_link_tags
+    @style_link_tags ||= doc.xpath("//head/link[@rel='stylesheet']").collect do |link|
+      <<~HTML
+        <link rel="stylesheet" href="#{URI("#{uri.origin}#{link['href']}")}">
+      HTML
+    end.join("\n")
+  end
+
+  def cover_img_url
+    cover_img_path = doc.xpath("//main//aside//div/a").first["href"]
+    URI("#{uri.origin}#{cover_img_path}").to_s
+  end
+
+  def page_uris
+    @page_uris ||= doc.xpath("//main//div/menu//li//a[@class='toc__link']").collect { |a| URI("#{uri.origin}#{a['href']}") }
+  end
+
+  def toc_html
+    @toc_html ||= doc.css("main menu li.toc__leaf").each.with_index do |node, i|
+      node.css("a.toc__title").first["href"] = "#page-#{i + 1}"
+    end.collect(&:to_s).join("\n")
+  end
+end
+
+class Render
+  extend Forwardable
+
+  attr_reader :book
+  def_delegators :book, :cover_img_url, :style_link_tags, :page_uris, :toc_html
+
+  def initialize(book)
+    @book = book
+  end
+
+  def to_pdf
+    BreezyPDFLite::RenderRequest.new(html).to_file
+  end
+
+  def to_html
+    Tempfile.new(["book", ".html"]).tap { |f| f.write(html); f.flush }
+  end
+
+  def html
+    @html ||= tmpl.result(binding)
+  end
+
+  def page_htmls
+    return @page_htmls if @page_htmls
+
+    @page_htmls = {}
+
+    page_uris.collect do |page_uri|
+      Thread.new do
+        page_html = Net::HTTP.get(page_uri)
+        page_doc = Nokogiri(page_html)
+        @page_htmls[page_uri] = page_doc.xpath("//main/*").collect(&:to_s).join
+      end
+    end.each(&:join)
+
+    @page_htmls
+  end
+
+  def tmpl
+    @tmpl ||= ERB.new(DATA.read)
+  end
+end
+
+class Writebook < Thor
+  package_name "Writebook"
+
+  desc "export URL", "exports Writebook at given URL to a PDF"
+  method_options output: :string, debug: :boolean
+  def export(url)
+    begin
+      Net::HTTP.get(URI(BreezyPDFLite.base_url)) == "OK"
+      say "BreezyPDFLite server is accessible...", :green
+    rescue StandardError => e
+      error "Unable to access breezy pdf lite server: #{e.inspect}\n\rMake sure it's running? See: https://github.com/danielwestendorf/breezy-pdf-lite"
+      exit(1)
+    end
+
+    say "Attempting to render book..."
+    render = Render.new(Book.new(url))
+    render.to_html
+    say "Book HTML collected..."
+
+    if options[:debug]
+      file = render.to_html
+      say "Debug HTML: #{file.path}", :yellow
+      yes? "Press enter to delete debug HTML and continue..."
+    end
+
+    say "Rendering as pdf..."
+    pdf = render.to_pdf
+    say "PDF Render complete...", :green
+    if options[:output]
+      FileUtils.cp pdf.path, options[:output]
+      say "Saved to #{options[:output]}", :green
+    else
+      system "open #{pdf.path}"
+      sleep 1 # wait to open before tmpfile unlink
+    end
+
+    say "Done."
+  end
+end
+
+Writebook.start
+
+__END__
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="breezy-pdf-displayBackground" content="true">
+  <%= style_link_tags %>
+
+  <style type="text/css">
+    html, body { margin: 0; padding: 0; }
+
+    #cover {
+      background-image: url("<%= cover_img_url %>");
+      background-size: cover;
+      background-size: 100% auto;
+      background-repeat: no-repeat;
+
+      width: 100vw;
+      height: 100vh;
+      page-break-after: always;
+    }
+
+    #toc {
+      page-break-after: always;
+    }
+
+    .page--page, .page--section {
+      page-break-before: left;
+    }
+
+    p, pre { page-break-inside: avoid; }
+
+    .heading__link { display: none; }
+
+    .toc__container { max-inline-size: unset; }
+
+    .toc {
+      display: flex;
+      flex-direction: column;
+      row-gap: calc(var(--block-space)* 0.3);
+    }
+
+    .toc__thumbnail { display: none !important; }
+
+    .toc__container .toc__leaf {
+      align-items: center;
+      column-gap: 1ch;
+      flex-direction: row;
+      justify-content: center;
+      row-gap: calc(var(--block-space)* 0.3);
+      text-align: start;
+    }
+
+    .toc__title {
+      flex-direction: row;
+      flex-grow: 1;
+      font-size: inherit;
+      white-space: nowrap;
+    }
+
+    .toc__title:after {
+      border-block-end: 1px dotted var(--title-border-color);
+      content: "";
+      flex-grow: 1;
+      margin-block-end: 0.25em;
+    }
+
+    @page {
+      margin: 0.15in;
+    }
+  </style>
+</head>
+<body>
+  <div id="cover"></div>
+  <div id="toc" class="toc__container">
+    <menu class="toc">
+      <%= toc_html %>
+    </menu>
+  </div>
+  <main id="main">
+    <% page_uris.each.with_index do |uri, i| %>
+      <div id="page-<%= i + 1 %>">
+        <%= page_htmls[uri] %>
+      </div>
+    <% end %>
+  </main>
+</body>
+</html>
